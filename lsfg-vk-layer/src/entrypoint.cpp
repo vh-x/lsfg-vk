@@ -284,6 +284,10 @@ namespace {
         try {
             // retire old swapchain
             if (info->oldSwapchain) {
+                // wait for the layer's in-flight work on the old swapchain to drain
+                // before destroying its semaphores, command buffers and fences
+                it->second.df().DeviceWaitIdle(it->second.dev());
+
                 const auto& info_mapping = instance_info->swapchainInfos.find(info->oldSwapchain);
                 if (info_mapping != instance_info->swapchainInfos.end())
                     instance_info->swapchainInfos.erase(info_mapping);
@@ -307,6 +311,18 @@ namespace {
                         throw ls::vulkan_error(res, "vkCreateSwapchainKHR() failed");
                 }
             );
+
+            // surface can transiently report extents too small for the framegen
+            // pipeline (e.g. X11 fullscreen transitions, or single-pixel surfaces
+            // during window initialization). Creating intermediate images or mipmap
+            // levels at those sizes yields zero-sized Vulkan objects and crashes
+            // the driver. Track the swapchain so present can pass through, but
+            // skip layer setup until it is recreated with a usable extent.
+            if (!layer_info->root.canDriveExtent(newInfo.imageExtent)) {
+                instance_info->swapchains.emplace(*swapchain,
+                    ls::R<vk::Vulkan>(it->second));
+                return VK_SUCCESS;
+            }
 
             // get all swapchain images
             uint32_t imageCount{};
@@ -364,8 +380,12 @@ namespace {
         if (reload) {
             try {
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
+                    if (!layer_info->root.hasSwapchainContext(swapchain))
+                        continue; // nothing to recreate for pass-through swapchains
                     auto& info = instance_info->swapchainInfos.at(swapchain);
 
+                    // wait for layer GPU work before destroying its resources
+                    vk.get().df().DeviceWaitIdle(vk.get().dev());
                     layer_info->root.removeSwapchainContext(swapchain);
                     layer_info->root.createSwapchainContext(vk, swapchain, info);
                 }
@@ -384,6 +404,25 @@ namespace {
             const auto& it = instance_info->swapchains.find(swapchain);
             if (it == instance_info->swapchains.end())
                 return VK_ERROR_INITIALIZATION_FAILED;
+
+            // swapchains we track but don't drive (e.g. zero-extent surfaces during
+            // a fullscreen transition) are forwarded untouched
+            if (!layer_info->root.hasSwapchainContext(swapchain)) {
+                VkPresentInfoKHR passInfo{
+                    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                    .pNext = info->pNext,
+                    .waitSemaphoreCount = i == 0 ? info->waitSemaphoreCount : 0,
+                    .pWaitSemaphores = i == 0 ? info->pWaitSemaphores : nullptr,
+                    .swapchainCount = 1,
+                    .pSwapchains = &swapchain,
+                    .pImageIndices = &info->pImageIndices[i],
+                    .pResults = info->pResults ? &info->pResults[i] : nullptr,
+                };
+                result = it->second.get().df().QueuePresentKHR(queue, &passInfo);
+                if (info->pResults)
+                    info->pResults[i] = result;
+                continue;
+            }
 
             try {
                 std::vector<VkSemaphore> waitSemaphores;
@@ -427,6 +466,10 @@ namespace {
         const auto& it = instance_info->devices.find(device);
         if (it == instance_info->devices.end())
             return;
+
+        // drain in-flight layer submissions before tearing down per-swapchain
+        // semaphores, command buffers and fences
+        it->second.df().DeviceWaitIdle(it->second.dev());
 
         const auto& info_mapping = instance_info->swapchainInfos.find(swapchain);
         if (info_mapping != instance_info->swapchainInfos.end())

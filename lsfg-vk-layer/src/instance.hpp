@@ -66,6 +66,29 @@ namespace lsfgvk::layer {
 
             return it->second;
         }
+        /// check if a swapchain has a layer context
+        /// @param swapchain swapchain handle
+        /// @return true if a context exists for the given swapchain
+        [[nodiscard]] bool hasSwapchainContext(VkSwapchainKHR swapchain) const {
+            return this->swapchains.contains(swapchain);
+        }
+        /// check whether the layer can drive a swapchain of the given extent.
+        /// The backend builds a 7-level mipmap chain over the flow extent,
+        /// so the smallest level (flowExtent >> 6) must be at least 1 pixel
+        /// in each dimension. flowExtent = extent * profile.flow_scale.
+        /// @param extent swapchain image extent
+        /// @return true if the extent is large enough for the framegen pipeline
+        [[nodiscard]] bool canDriveExtent(VkExtent2D extent) const {
+            if (!this->active_profile.has_value())
+                return false;
+            if (extent.width == 0 || extent.height == 0)
+                return false;
+            const float scale = this->active_profile->flow_scale;
+            const auto flowW = static_cast<uint32_t>(static_cast<float>(extent.width) * scale);
+            const auto flowH = static_cast<uint32_t>(static_cast<float>(extent.height) * scale);
+            constexpr uint32_t kMinFlowDim = 64; // 7-level mipmap = shift by 6
+            return flowW >= kMinFlowDim && flowH >= kMinFlowDim;
+        }
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
