@@ -106,6 +106,13 @@ namespace lsfgvk::backend {
         /// (see lsfg-vk documentation)
         void scheduleFrames();
     private:
+        // The per-frame command stream depends on the frame index only through
+        // descriptor-set selection: fidx % 2 (mipmaps, generate) and fidx % 3
+        // (the temporal alpha1[0]/beta0/gamma0[6]/delta0[6] sets). It is therefore
+        // periodic in fidx with period lcm(2, 3) = 6. We pre-record all 6 variants
+        // once and resubmit the matching one each frame instead of re-recording.
+        static constexpr size_t kVariants = 6;
+
         std::pair<vk::Image, vk::Image> sourceImages;
         std::vector<vk::Image> destImages;
         vk::Image blackImage;
@@ -409,7 +416,7 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
         blackImage(createBlackImage(instance.getVulkan())),
         syncSemaphore(importTimelineSemaphore(instance.getVulkan(), syncFd)),
         prepassSemaphore(createPrepassSemaphore(instance.getVulkan())),
-        cmdbufs(createCommandBuffers(instance.getVulkan(), destFds.size() + 1)),
+        cmdbufs(createCommandBuffers(instance.getVulkan(), kVariants * (destFds.size() + 1))),
         cmdbufFence(instance.getVulkan()),
         ctx(createCtx(instance, extent, hdr, flow, perf, destFds.size())),
         mipmaps(ctx, sourceImages),
@@ -547,6 +554,43 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
     cmdbuf.insertBarriers(ctx.vk, barriers);
     cmdbuf.end(ctx.vk);
     cmdbuf.submit(ctx.vk); // wait for completion
+
+    // pre-record all command buffer variants (see kVariants). Each variant v
+    // records exactly what scheduleFrames() used to record for a frame with
+    // fidx % kVariants == v; passing v as the index reproduces the same
+    // descriptor-set selection (v % 2 and v % 3 match fidx % 2 and fidx % 3).
+    // begin(..., false) records for repeated submission rather than one-time use.
+    const size_t stride = this->destImages.size() + 1;
+    for (size_t v = 0; v < kVariants; ++v) {
+        const auto& prepass = this->cmdbufs.at(v * stride);
+        prepass.begin(ctx.vk, false);
+        this->mipmaps.render(ctx.vk, prepass, v);
+        for (size_t i = 0; i < 7; ++i) {
+            this->alpha0.at(6 - i).render(ctx.vk, prepass);
+            this->alpha1.at(6 - i).render(ctx.vk, prepass, v);
+        }
+        this->beta0.render(ctx.vk, prepass, v);
+        this->beta1.render(ctx.vk, prepass);
+        prepass.end(ctx.vk);
+
+        for (size_t i = 0; i < this->destImages.size(); ++i) {
+            const auto& mainpass = this->cmdbufs.at((v * stride) + 1 + i);
+            mainpass.begin(ctx.vk, false);
+
+            const auto& pass = this->passes.at(i);
+            for (size_t j = 0; j < 7; j++) {
+                pass.gamma0.at(j).render(ctx.vk, mainpass, v);
+                pass.gamma1.at(j).render(ctx.vk, mainpass);
+
+                if (j < 4) continue;
+                pass.delta0.at(j - 4).render(ctx.vk, mainpass, v);
+                pass.delta1.at(j - 4).render(ctx.vk, mainpass);
+            }
+            pass.generate->render(ctx.vk, mainpass, v);
+
+            mainpass.end(ctx.vk);
+        }
+    }
 }
 
 void Instance::scheduleFrames(Context& context) { // NOLINT (static)
@@ -579,20 +623,14 @@ void Context::scheduleFrames() {
         throw backend::error("Timeout waiting for previous frame to complete");
     this->cmdbufFence.reset(this->ctx.vk);
 
+    // select the pre-recorded variant for this frame (see kVariants). The
+    // fence wait above guarantees the previous frame fully completed, so the
+    // variant being submitted (last used kVariants frames ago) is never pending.
+    const size_t stride = this->destImages.size() + 1;
+    const size_t base = (this->fidx % kVariants) * stride;
+
     // schedule pre-pass
-    const auto& cmdbuf = this->cmdbufs.at(0);
-    cmdbuf.begin(ctx.vk);
-
-    this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
-    for (size_t i = 0; i < 7; ++i) {
-        this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
-        this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
-    }
-    this->beta0.render(ctx.vk, cmdbuf, this->fidx);
-    this->beta1.render(ctx.vk, cmdbuf);
-
-    cmdbuf.end(ctx.vk);
-    cmdbuf.submit(this->ctx.vk,
+    this->cmdbufs.at(base).submit(this->ctx.vk,
         {}, this->syncSemaphore.handle(), this->idx,
         {}, this->prepassSemaphore.handle(), this->idx
     );
@@ -601,22 +639,7 @@ void Context::scheduleFrames() {
 
     // schedule main passes
     for (size_t i = 0; i < this->destImages.size(); i++) {
-        const auto& cmdbuf = this->cmdbufs.at(i + 1);
-        cmdbuf.begin(ctx.vk);
-
-        const auto& pass = this->passes.at(i);
-        for (size_t j = 0; j < 7; j++) {
-            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
-            pass.gamma1.at(j).render(ctx.vk, cmdbuf);
-
-            if (j < 4) continue;
-            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
-            pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
-        }
-        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
-
-        cmdbuf.end(ctx.vk);
-        cmdbuf.submit(this->ctx.vk,
+        this->cmdbufs.at(base + 1 + i).submit(this->ctx.vk,
             {}, this->prepassSemaphore.handle(), this->idx - 1,
             {}, this->syncSemaphore.handle(), this->idx + i,
             i == this->destImages.size() - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE

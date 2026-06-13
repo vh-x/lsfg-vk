@@ -29,8 +29,10 @@ namespace vk {
 
         /// begin recording commands
         /// @param vk the vulkan instance
+        /// @param oneTimeSubmit whether this recording is submitted exactly once;
+        ///        pass false for pre-recorded buffers that are resubmitted as-is
         /// @throws ls::vulkan_error on failure
-        void begin(const vk::Vulkan& vk) const;
+        void begin(const vk::Vulkan& vk, bool oneTimeSubmit = true) const;
 
         /// blit an image
         /// @param vk the vulkan instance
